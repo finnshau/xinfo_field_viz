@@ -611,7 +611,10 @@ def render_play_png(play_id: int, game_code: int, _hash: str) -> bytes:
     yd = row.get('yd_from_goal')
     if pd.notna(yd):
         yd_from_goal = int(float(yd))
-        yard_line = 100 - yd_from_goal if yd_from_goal > 50 else yd_from_goal
+        # yard_line is distance from the LEFT endzone (how preview_field.py expects it).
+        # yd_from_goal is yards to the RIGHT (attacking) endzone, so:
+        # yard_line = 100 - yd_from_goal always places offense driving right.
+        yard_line = 100 - yd_from_goal
     else:
         yard_line = 50
 
@@ -622,6 +625,7 @@ def render_play_png(play_id: int, game_code: int, _hash: str) -> bytes:
         df_coords=df_off, df_def_coords=df_def,
         title='', yard_line=yard_line, attacking_right=True,
         off_team=off_team, def_team=def_team,
+        home_team=_clean(row.get('home_team_nickname'), ''),
     )
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
@@ -1029,7 +1033,7 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
                        receiver_name=None, player_routes=None, targeted_name=None,
                        player_ids=None, play_coverage=None, targeting_rates=None, player_roles=None,
                        play_type=None, play_concept=None, run_direction=None, rusher_name=None,
-                       player_route_dists=None):
+                       player_route_dists=None, home_team=''):
     """
     Replicate the plot_offense_v2 field in Plotly with hover tooltips.
     All visual parameters mirror plot_offense_v2 exactly — only hover is new.
@@ -1060,6 +1064,24 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
     x_min, x_max = -15.0, 30.0
     y_min, y_max =   0.0, 53.3
 
+    # Goal lines / end lines in plot coords (x=0 is the LOS, 1 unit = 1 yard)
+    ENDZONE_DEPTH = 10.0
+    _goal_left_x  = float(-yard_line)
+    _goal_right_x = float(100 - yard_line)
+    _end_left_x   = _goal_left_x  - ENDZONE_DEPTH
+    _end_right_x  = _goal_right_x + ENDZONE_DEPTH
+
+    # Slide the view window (same width) so it never runs past an end line —
+    # near the goal line this shows more field behind the offense instead of
+    # empty space beyond the end zone.
+    _view_w = x_max - x_min
+    if x_max > _end_right_x:
+        x_max = _end_right_x
+        x_min = x_max - _view_w
+    elif x_min < _end_left_x:
+        x_min = _end_left_x
+        x_max = x_min + _view_w
+
     def _to_plot(x_ft, y_ft):
         px = x_ft / 3
         py = y_ft / 3
@@ -1088,22 +1110,27 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
             fig.add_shape(type='rect', x0=left, x1=right, y0=y_min, y1=y_max,
                           fillcolor=color, line_width=0, layer='below')
 
-    # Sidelines
-    fig.add_shape(type='line', x0=x_min, x1=x_max, y0=y_min, y1=y_min,
+    # Sidelines (stop at the end lines)
+    _sl_x0 = max(x_min, _end_left_x)
+    _sl_x1 = min(x_max, _end_right_x)
+    fig.add_shape(type='line', x0=_sl_x0, x1=_sl_x1, y0=y_min, y1=y_min,
                   line=dict(color='white', width=2.5))
-    fig.add_shape(type='line', x0=x_min, x1=x_max, y0=y_max, y1=y_max,
+    fig.add_shape(type='line', x0=_sl_x0, x1=_sl_x1, y0=y_max, y1=y_max,
                   line=dict(color='white', width=2.5))
 
-    # Per-yard tick marks
+    # Per-yard tick marks (field of play only — none in the end zones)
     TICK_H = 0.5 * SCALE
     for yd in range(int(x_min), int(x_max) + 1):
+        if not (_goal_left_x < yd < _goal_right_x):
+            continue
         fig.add_shape(type='line', x0=yd, x1=yd, y0=y_min, y1=y_min + TICK_H,
                       line=dict(color='white', width=0.7), opacity=0.5)
         fig.add_shape(type='line', x0=yd, x1=yd, y0=y_max - TICK_H, y1=y_max,
                       line=dict(color='white', width=0.7), opacity=0.5)
 
-    # 10-yard markers + numbers
-    for marker in range(0, 101, 10):
+    # 10-yard markers + numbers: 10 20 30 40 50 40 30 20 10
+    # (goal lines at 0 / 100 carry no number — they're drawn with the end zones)
+    for marker in range(10, 100, 10):
         yard_x = float(marker - yard_line)
         if x_min <= yard_x <= x_max:
             # Draw the faint yard line only when it doesn't coincide with the LOS
@@ -1122,27 +1149,53 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
     HASH_W = 0.15 * SCALE
     for hash_y in (17.4, 35.9):
         for hx in range(int(x_min) - 1, int(x_max) + 2):
+            if not (_goal_left_x < hx < _goal_right_x):
+                continue
             fig.add_shape(type='line', x0=hx - HASH_W, x1=hx + HASH_W,
                           y0=hash_y, y1=hash_y,
                           line=dict(color='white', width=1.0), opacity=0.6)
 
-    # Conditional end zone
+    # End zones — painted in the HOME team's color with the home team name,
+    # like a real stadium. Falls back to def/off team if home team is unknown.
     def _primary(team):
         return NFL_TEAM_COLORS.get(str(team).strip(), {}).get('primary', '#1a4a1a')
 
-    _yds_to_goal = 100 - yard_line
-    if _yds_to_goal <= 20:
-        _goal_x = float(_yds_to_goal)
-        fig.add_shape(type='rect', x0=_goal_x, x1=x_max, y0=y_min, y1=y_max,
-                      fillcolor=_primary(def_team), opacity=0.55, line_width=0, layer='below')
-        fig.add_shape(type='line', x0=_goal_x, x1=_goal_x, y0=y_min, y1=y_max,
-                      line=dict(color='white', width=2.5))
-    elif _yds_to_goal >= 80:
-        _goal_x = float(_yds_to_goal - 100)
-        fig.add_shape(type='rect', x0=x_min, x1=_goal_x, y0=y_min, y1=y_max,
-                      fillcolor=_primary(off_team), opacity=0.55, line_width=0, layer='below')
-        fig.add_shape(type='line', x0=_goal_x, x1=_goal_x, y0=y_min, y1=y_max,
-                      line=dict(color='white', width=2.5))
+    def _draw_endzone(goal_x, end_x, team, textangle):
+        lo, hi = sorted((goal_x, end_x))
+        vis_lo, vis_hi = max(lo, x_min), min(hi, x_max)
+        if vis_hi <= vis_lo:
+            return
+        # End zone fill
+        fig.add_shape(type='rect', x0=vis_lo, x1=vis_hi, y0=y_min, y1=y_max,
+                      fillcolor=_primary(team), opacity=0.55, line_width=0, layer='below')
+        # Out of bounds beyond the end line
+        if goal_x < end_x and end_x < x_max:
+            fig.add_shape(type='rect', x0=end_x, x1=x_max, y0=y_min, y1=y_max,
+                          fillcolor=C_BG, opacity=1.0, line_width=0, layer='below')
+        elif goal_x > end_x and end_x > x_min:
+            fig.add_shape(type='rect', x0=x_min, x1=end_x, y0=y_min, y1=y_max,
+                          fillcolor=C_BG, opacity=1.0, line_width=0, layer='below')
+        # Goal line + end line
+        for lx in (goal_x, end_x):
+            if x_min <= lx <= x_max:
+                fig.add_shape(type='line', x0=lx, x1=lx, y0=y_min, y1=y_max,
+                              line=dict(color='white', width=2.5))
+        # Team name, centered in the visible part of the end zone
+        label = str(team or '').strip().upper()
+        vis_w = vis_hi - vis_lo
+        if label and vis_w >= 3.0:
+            fs = min(40, 5.0 * vis_w, 460 / max(len(label), 1))
+            fig.add_annotation(x=(vis_lo + vis_hi) / 2, y=(y_min + y_max) / 2,
+                               text=f'<b>{label}</b>', showarrow=False,
+                               textangle=textangle, xanchor='center', yanchor='middle',
+                               font=dict(color='white', size=fs, family='Arial Black'),
+                               opacity=0.9)
+
+    _ez_right_team = home_team or def_team
+    _ez_left_team  = home_team or off_team
+    # Letters face the field of play: right end zone reads top→bottom, left reads bottom→top
+    _draw_endzone(_goal_right_x, _end_right_x, _ez_right_team, textangle=90)
+    _draw_endzone(_goal_left_x,  _end_left_x,  _ez_left_team,  textangle=-90)
 
     # LOS
     fig.add_shape(type='line', x0=0, x1=0, y0=y_min, y1=y_max,
@@ -1791,7 +1844,9 @@ def main():
     pid = st.session_state['rendered_pid']
     gc  = st.session_state['rendered_gc']
 
-    _data_hash = str(DATA_PATH.stat().st_mtime)
+    import os as _os
+    _field_mtime = str(_os.path.getmtime(Path(__file__).parent / 'xinfoviz_preview_field.py'))
+    _data_hash = str(DATA_PATH.stat().st_mtime) + _field_mtime
     with st.spinner('Rendering…'):
         try:
             row, df_off, df_def, receiver_name, player_routes, targeted_name, player_ids, play_coverage, player_roles, player_route_dists, events_passer, events_rusher, events_receiver = render_play(
@@ -1807,10 +1862,12 @@ def main():
     _yd = row.get('yd_from_goal')
     if pd.notna(_yd):
         _yd_from_goal = int(float(_yd))
-        yard_line = 100 - _yd_from_goal if _yd_from_goal > 50 else _yd_from_goal
+        # yard_line = distance from LEFT endzone; yd_from_goal = distance from
+        # RIGHT (attacking) endzone, so 100 - yd_from_goal always drives right.
+        yard_line = 100 - _yd_from_goal
     else:
         yard_line = 50
-    attacking_right = True  # offense always on left, defense on right
+    attacking_right = True  # offense always attacks right endzone
 
     # ── Extract values ────────────────────────────────────────────────────────
     off   = _clean(row.get('offensive_team_nickname'), '—')
@@ -1916,6 +1973,7 @@ def main():
             play_concept=_clean(row.get('play_concept_desc'), ''),
             run_direction=_clean(row.get('initial_run_direction'), ''),
             rusher_name=_clean(row.get('rusher'), ''),
+            home_team=_clean(row.get('home_team_nickname'), ''),
         )
         st.plotly_chart(plotly_fig, use_container_width=True, config={'displayModeBar': False})
         dn   = down_map.get(_safe_int(row.get('down'), 0), 'X')

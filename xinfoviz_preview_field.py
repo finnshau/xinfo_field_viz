@@ -388,6 +388,7 @@ def plot_offense_v2(
     attacking_right=True,
     off_team='',
     def_team='',
+    home_team='',
 ):
     # ── Scale factor ─────────────────────────────────────────────────────────
     # Field renders at full size (SCALE=1.0) and is saved at 300 DPI.
@@ -428,6 +429,24 @@ def plot_offense_v2(
     x_min, x_max = -20.0, 20.0
     y_min, y_max =   0.0, 53.3
 
+    # Goal lines / end lines in plot coords (x=0 is the LOS, 1 unit = 1 yard)
+    ENDZONE_DEPTH = 10.0
+    _goal_left_x  = float(-yard_line)
+    _goal_right_x = float(100 - yard_line)
+    _end_left_x   = _goal_left_x  - ENDZONE_DEPTH
+    _end_right_x  = _goal_right_x + ENDZONE_DEPTH
+
+    # Slide the view window (same width) so it never runs past an end line —
+    # near the goal line this shows more field behind the offense instead of
+    # empty space beyond the end zone.
+    _view_w = x_max - x_min
+    if x_max > _end_right_x:
+        x_max = _end_right_x
+        x_min = x_max - _view_w
+    elif x_min < _end_left_x:
+        x_min = _end_left_x
+        x_max = x_min + _view_w
+
     fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
     fig.patch.set_facecolor(C_BG)
     ax.set_facecolor(C_FIELD_A)
@@ -439,62 +458,81 @@ def plot_offense_v2(
         if left < right:
             ax.axvspan(left, right, color=(C_FIELD_A, C_FIELD_B)[idx % 2], zorder=0)
 
-    # Sidelines
-    ax.axhline(y_min, color='white', linewidth=LW_SIDE, zorder=2)
-    ax.axhline(y_max, color='white', linewidth=LW_SIDE, zorder=2)
+    # Sidelines (stop at the end lines)
+    _sl_x0 = max(x_min, _end_left_x)
+    _sl_x1 = min(x_max, _end_right_x)
+    ax.plot([_sl_x0, _sl_x1], [y_min, y_min], color='white', linewidth=LW_SIDE, zorder=2)
+    ax.plot([_sl_x0, _sl_x1], [y_max, y_max], color='white', linewidth=LW_SIDE, zorder=2)
 
-    # Per-yard tick marks
+    # Per-yard tick marks (field of play only — none in the end zones)
     for yd in range(int(x_min), int(x_max) + 1):
+        if not (_goal_left_x < yd < _goal_right_x):
+            continue
         ax.plot([yd, yd], [y_min, y_min + TICK_H], color='white', linewidth=LW_TICK, alpha=0.5, zorder=2)
         ax.plot([yd, yd], [y_max - TICK_H, y_max], color='white', linewidth=LW_TICK, alpha=0.5, zorder=2)
 
-    # 10-yard markers + numbers
-    for marker in range(0, 101, 10):
+    # 10-yard markers + numbers: 10 20 30 40 50 40 30 20 10
+    # (goal lines at 0 / 100 carry no number — they're drawn with the end zones)
+    for marker in range(10, 100, 10):
         yard_x = float(marker - yard_line)
-        if x_min <= yard_x <= x_max and yard_x != 0:
+        label_val = marker if marker <= 50 else (100 - marker)
+        if x_min <= yard_x <= x_max and yard_x != 0 and label_val != 0:
             ax.axvline(yard_x, color='white', linewidth=LW_YARD, alpha=0.3, zorder=2)
-            label_val = marker if marker <= 50 else (100 - marker)
-            label_str = str(int(label_val))
-            ax.text(yard_x, y_min + 1.6, str(int(label_val)), ha='center', va='bottom',
-        color='white', fontsize=FONT_YARD, fontweight='bold', alpha=0.18, zorder=1)
-            ax.text(yard_x, y_max - 1.6, str(int(label_val)), ha='center', va='top',
-        color='white', fontsize=FONT_YARD, fontweight='bold', alpha=0.18, zorder=1)
+            ax.text(yard_x, y_min + 1.6, str(int(label_val)),
+                    ha='center', va='bottom', color='white',
+                    fontsize=FONT_YARD, fontweight='bold', alpha=0.18, zorder=1)
+            ax.text(yard_x, y_max - 1.6, str(int(label_val)),
+                    ha='center', va='top', color='white',
+                    fontsize=FONT_YARD, fontweight='bold', alpha=0.18, zorder=1)
 
     # Hash marks
     for hash_y in (70.75 / 3, 53.3333333333 - 70.75 / 3):
         for hx in range(int(x_min) - 1, int(x_max) + 2):
+            if not (_goal_left_x < hx < _goal_right_x):
+                continue
             ax.plot([hx - HASH_W, hx + HASH_W], [hash_y, hash_y],
                     color='white', linewidth=LW_HASH, alpha=0.6, zorder=3)
 
-    # Conditional end zone
+    # End zones — painted in the HOME team's color with the home team name,
+    # like a real stadium. Falls back to def/off team if home team is unknown.
     import matplotlib.patches as _mp
-    _yds_to_goal = 100 - yard_line
 
     def _primary(team):
         return NFL_TEAM_COLORS.get(str(team).strip(), {}).get('primary', '#1a4a1a')
 
-    if _yds_to_goal <= 20:
-        _goal_x = float(_yds_to_goal)
-        ax.add_patch(_mp.Rectangle((_goal_x, y_min), x_max - _goal_x, y_max - y_min,
-                                   facecolor=_primary(def_team), alpha=0.55, zorder=1, linewidth=0))
-        ax.axvline(_goal_x, color='white', linewidth=LW_SIDE, zorder=4)
-        _w = x_max - _goal_x
-        if _w >= 2.0:
-            _label = str(def_team).upper()
-            _fs = min(16*SCALE, max(8*SCALE, 30*SCALE/max(len(_label),1)))
-            ax.text(_goal_x+_w/2, (y_min+y_max)/2, _label, ha='center', va='center',
-                    rotation=270, fontsize=_fs, fontweight='bold', color='white', alpha=0.9, zorder=5)
-    elif _yds_to_goal >= 80:
-        _goal_x = float(_yds_to_goal - 100)
-        ax.add_patch(_mp.Rectangle((x_min, y_min), _goal_x - x_min, y_max - y_min,
-                                   facecolor=_primary(off_team), alpha=0.55, zorder=1, linewidth=0))
-        ax.axvline(_goal_x, color='white', linewidth=LW_SIDE, zorder=4)
-        _w = _goal_x - x_min
-        if _w >= 2.0:
-            _label = str(off_team).upper()
-            _fs = min(16*SCALE, max(8*SCALE, 30*SCALE/max(len(_label),1)))
-            ax.text(x_min+_w/2, (y_min+y_max)/2, _label, ha='center', va='center',
-                    rotation=90, fontsize=_fs, fontweight='bold', color='white', alpha=0.9, zorder=5)
+    def _draw_endzone(goal_x, end_x, team, rotation):
+        lo, hi = sorted((goal_x, end_x))
+        vis_lo, vis_hi = max(lo, x_min), min(hi, x_max)
+        if vis_hi <= vis_lo:
+            return
+        # Out of bounds beyond the end line (covers grass stripes)
+        if goal_x < end_x and end_x < x_max:
+            ax.add_patch(_mp.Rectangle((end_x, y_min), x_max - end_x, y_max - y_min,
+                                       facecolor=C_BG, alpha=1.0, zorder=0.5, linewidth=0))
+        elif goal_x > end_x and end_x > x_min:
+            ax.add_patch(_mp.Rectangle((x_min, y_min), end_x - x_min, y_max - y_min,
+                                       facecolor=C_BG, alpha=1.0, zorder=0.5, linewidth=0))
+        # End zone fill
+        ax.add_patch(_mp.Rectangle((vis_lo, y_min), vis_hi - vis_lo, y_max - y_min,
+                                   facecolor=_primary(team), alpha=0.55, zorder=1, linewidth=0))
+        # Goal line + end line
+        for lx in (goal_x, end_x):
+            if x_min <= lx <= x_max:
+                ax.axvline(lx, color='white', linewidth=LW_SIDE, zorder=4)
+        # Team name, centered in the visible part of the end zone
+        label = str(team or '').strip().upper()
+        vis_w = vis_hi - vis_lo
+        if label and vis_w >= 3.0:
+            fs = min(60*SCALE, 12*SCALE*vis_w, 620*SCALE/max(len(label), 1))
+            ax.text((vis_lo + vis_hi)/2, (y_min + y_max)/2, label, ha='center', va='center',
+                    rotation=rotation, fontsize=fs, fontweight='bold', color='white',
+                    alpha=0.9, zorder=5)
+
+    _ez_right_team = home_team or def_team
+    _ez_left_team  = home_team or off_team
+    # Letters face the field of play: right end zone reads top→bottom, left reads bottom→top
+    _draw_endzone(_goal_right_x, _end_right_x, _ez_right_team, rotation=270)
+    _draw_endzone(_goal_left_x,  _end_left_x,  _ez_left_team,  rotation=90)
 
     # LOS
     ax.axvline(0, color='white', linewidth=LW_LOS, zorder=4)
