@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data
+data/raw/*.csv
+data/raw/*.xlsx
+
+# Output
+outputs/figures/*.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+*.bak
+*.tmp
