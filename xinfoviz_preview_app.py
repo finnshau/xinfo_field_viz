@@ -183,7 +183,7 @@ def load_old_catalog_receivers(path: Path) -> pd.DataFrame:
         for col in want_out:
             if col not in df.columns:
                 df[col] = None
-        df['play_unique_id'] = pd.to_numeric(df['play_unique_id'], errors='coerce')
+        df['play_unique_id'] = pd.to_numeric(df['play_unique_id'], errors='coerce').astype('Int64')
         df['receiver_id']    = pd.to_numeric(df['receiver_id'],    errors='coerce')
         df['passer_id']      = pd.to_numeric(df['passer_id'],      errors='coerce')
         df['rusher_id']      = pd.to_numeric(df['rusher_id'],      errors='coerce')
@@ -541,7 +541,8 @@ def render_play(play_id: int, game_code: int, _hash: str):
     events_receiver = ''   # Full name "First Last" from events file
     try:
         old_cat   = load_old_catalog_receivers(DATA_PATH_OLD)
-        old_match = old_cat[old_cat['play_unique_id'] == play_id]
+        _pid      = pd.to_numeric(play_id, errors='coerce')
+        old_match = old_cat[old_cat['play_unique_id'] == _pid]
         if not old_match.empty:
             old_row = old_match.iloc[0]
 
