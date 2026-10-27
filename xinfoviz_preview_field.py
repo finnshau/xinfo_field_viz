@@ -562,6 +562,8 @@ def plot_offense_v2(
             px = -px
             py = 53.3 - py
 
+        # Keep players on the field: deep defenders can't sit past the end line
+        px = max(_end_left_x + 1.0, min(px, _end_right_x - 1.0))
         return px, py
 
     def _label_offset_pts(px, py, all_xs, all_ys, prefer_right=True):

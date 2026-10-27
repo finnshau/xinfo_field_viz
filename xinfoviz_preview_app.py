@@ -30,6 +30,60 @@ for _p in (str(PROJECT_ROOT), str(SRC_DIR)):
 
 from xinfoviz_preview_field import map_offense_to_coordinates, map_defense_to_coordinates, plot_offense_v2, NFL_TEAM_COLORS
 
+import os
+import time
+from contextlib import contextmanager
+
+# ── Performance helpers ──────────────────────────────────────────────────────
+# Set XINFOVIZ_TIMING=1 before `streamlit run` to print a timing line per step
+# to the terminal (e.g. `XINFOVIZ_TIMING=1 streamlit run app.py`).
+_TIMING = os.environ.get('XINFOVIZ_TIMING', '') not in ('', '0')
+
+
+@contextmanager
+def _timed(label):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        if _TIMING:
+            print(f'[xinfoviz] {label:<28} {time.perf_counter() - t0:6.2f}s', flush=True)
+
+
+def _data_key() -> str:
+    """Changes whenever a data file or the field module changes — used as a
+    cache key so cached results refresh automatically after a data update."""
+    parts = []
+    for p in (DATA_PATH, DATA_PATH_OLD, PROJECT_ROOT / 'xinfoviz_preview_field.py',
+              SRC_DIR / 'xinfoviz_preview_field.py'):
+        try:
+            parts.append(f'{p.name}:{p.stat().st_mtime_ns}')
+        except OSError:
+            pass
+    return '|'.join(parts)
+
+
+def _disk_cached(src: Path, tag: str, build):
+    """Return build(), saving the result as a parquet file next to `src` so
+    the next server start reads it in well under a second. The saved copy is
+    rebuilt automatically when `src` is newer. Any problem writing/reading the
+    cache just falls back to build()."""
+    cache = src.with_name(f'.{src.stem}.{tag}.cache.parquet')
+    try:
+        if cache.exists() and cache.stat().st_mtime_ns >= src.stat().st_mtime_ns:
+            return pd.read_parquet(cache)
+    except Exception:
+        pass
+    df = build()
+    try:
+        df.to_parquet(cache, index=False)
+    except Exception:
+        try:
+            cache.unlink()
+        except OSError:
+            pass
+    return df
+
 st.set_page_config(
     page_title='xInfoViz',
     page_icon='🏈',
@@ -153,9 +207,39 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(show_spinner='Loading events data…')
-def load_old_catalog_receivers(path: Path) -> pd.DataFrame:
-    """Load play-level name + coverage data from 2026NFLEventsXl.xlsx."""
+def _excel_engine():
+    """python-calamine reads .xlsx roughly 10x faster than openpyxl.
+    Install it with `pip install python-calamine` (pandas >= 2.2)."""
+    try:
+        import python_calamine  # noqa: F401
+        from pandas.io.excel._calamine import CalamineReader  # noqa: F401
+        return 'calamine'
+    except Exception:
+        return 'openpyxl'
+
+
+# cache_resource (not cache_data): every rerun shares ONE in-memory copy
+# instead of un-pickling a fresh copy of the table each time. Callers treat it
+# as read-only.
+@st.cache_resource(show_spinner='Loading events data…', max_entries=2)
+def load_old_catalog_receivers(path: Path, data_key: str = '') -> pd.DataFrame:
+    """Load play-level name + coverage data from 2026NFLEventsXl.xlsx.
+    The slimmed-down result is also saved next to the .xlsx so later server
+    starts skip the slow Excel parse entirely."""
+    want_out = ['play_unique_id', 'passer', 'passer_id', 'rusher', 'rusher_id',
+                'receiver', 'receiver_id', 'coverage_concept_desc']
+    try:
+        with _timed('load events file'):
+            return _disk_cached(Path(path), 'events', lambda: _read_old_catalog(path))
+    except Exception as _e:
+        # Store error for debug expander; return empty so app still runs
+        st.session_state['_evt_load_error'] = str(_e)
+        return pd.DataFrame(columns=want_out)
+
+
+def _read_old_catalog(path: Path) -> pd.DataFrame:
+    want_out = ['play_unique_id', 'passer', 'passer_id', 'rusher', 'rusher_id',
+                'receiver', 'receiver_id', 'coverage_concept_desc']
     _col_map = {
         'PLAY_UNIQUE_ID':        'play_unique_id',
         'PASSER':                'passer',
@@ -168,31 +252,27 @@ def load_old_catalog_receivers(path: Path) -> pd.DataFrame:
     }
     want_out = ['play_unique_id', 'passer', 'passer_id', 'rusher', 'rusher_id',
                 'receiver', 'receiver_id', 'coverage_concept_desc']
-    try:
-        ext = str(path).lower()
-        if ext.endswith('.xlsx') or ext.endswith('.xls'):
-            # Read all columns first (avoids openpyxl usecols lambda issues),
-            # then filter down to the ones we want.
-            df = pd.read_excel(path, engine='openpyxl')
-        else:
-            df = pd.read_csv(path, low_memory=False)
-        # Normalise column names to upper for matching
-        df.columns = [str(c).strip() for c in df.columns]
-        keep = {c: _col_map[c.upper()] for c in df.columns if c.upper() in _col_map}
-        df = df[list(keep.keys())].rename(columns=keep)
-        for col in want_out:
-            if col not in df.columns:
-                df[col] = None
-        df['play_unique_id'] = pd.to_numeric(df['play_unique_id'], errors='coerce').astype('Int64')
-        df['receiver_id']    = pd.to_numeric(df['receiver_id'],    errors='coerce')
-        df['passer_id']      = pd.to_numeric(df['passer_id'],      errors='coerce')
-        df['rusher_id']      = pd.to_numeric(df['rusher_id'],      errors='coerce')
-        return df[want_out].drop_duplicates('play_unique_id')
-    except Exception as _e:
-        # Store error for debug expander; return empty so app still runs
-        import streamlit as _st
-        _st.session_state['_evt_load_error'] = str(_e)
-        return pd.DataFrame(columns=want_out)
+    ext = str(path).lower()
+    if ext.endswith('.xlsx') or ext.endswith('.xls'):
+        # Read all columns first (avoids openpyxl usecols lambda issues),
+        # then filter down to the ones we want.
+        df = pd.read_excel(path, engine=_excel_engine())
+    else:
+        df = pd.read_csv(path, low_memory=False)
+    # Normalise column names to upper for matching
+    df.columns = [str(c).strip() for c in df.columns]
+    keep = {c: _col_map[c.upper()] for c in df.columns if c.upper() in _col_map}
+    df = df[list(keep.keys())].rename(columns=keep)
+    for col in want_out:
+        if col not in df.columns:
+            df[col] = None
+    df['play_unique_id'] = pd.to_numeric(df['play_unique_id'], errors='coerce').astype('Int64')
+    df['receiver_id']    = pd.to_numeric(df['receiver_id'],    errors='coerce')
+    df['passer_id']      = pd.to_numeric(df['passer_id'],      errors='coerce')
+    df['rusher_id']      = pd.to_numeric(df['rusher_id'],      errors='coerce')
+    for col in ('passer', 'rusher', 'receiver', 'coverage_concept_desc'):
+        df[col] = df[col].astype('object')
+    return df[want_out].drop_duplicates('play_unique_id').reset_index(drop=True)
 
 
 @st.cache_data(show_spinner='Merging x-stats…')
@@ -280,8 +360,8 @@ def _role_group(role_str: str) -> str:
     return _ROLE_GROUP.get(str(role_str).strip().upper(), 'Other')
 
 
-@st.cache_data(show_spinner='Building targeting stats…')
-def build_targeting_rates(_new_cat: pd.DataFrame, _old_cat: pd.DataFrame) -> pd.DataFrame:
+@st.cache_resource(show_spinner='Building targeting stats…', max_entries=2)
+def build_targeting_rates(_new_cat: pd.DataFrame, _old_cat: pd.DataFrame, data_key: str = '') -> pd.DataFrame:
     """
     Returns a DataFrame with columns:
         last_name, role_group, route, coverage,
@@ -308,6 +388,7 @@ def build_targeting_rates(_new_cat: pd.DataFrame, _old_cat: pd.DataFrame) -> pd.
     if not slots:
         return pd.DataFrame()
 
+    _t0 = time.perf_counter()
     plays = pd.concat(slots, ignore_index=True)
     plays['player_id'] = pd.to_numeric(plays['player_id'], errors='coerce')
 
@@ -317,7 +398,8 @@ def build_targeting_rates(_new_cat: pd.DataFrame, _old_cat: pd.DataFrame) -> pd.
     plays = plays[~plays['route'].str.lower().isin(['no route', 'no_route', 'none', 'nan', '—', ''])]
 
     # Map role → position group
-    plays['role_group'] = plays['role'].apply(_role_group)
+    plays['role_group'] = (plays['role'].astype(str).str.strip().str.upper()
+                           .map(_ROLE_GROUP).fillna('Other'))
 
     # Join coverage + receiver_id + success_play from old catalog
     old_slim = _old_cat[['play_unique_id', 'receiver_id', 'coverage_concept_desc']].copy()
@@ -329,9 +411,8 @@ def build_targeting_rates(_new_cat: pd.DataFrame, _old_cat: pd.DataFrame) -> pd.
     if 'success_play' in _new_cat.columns:
         success_slim = _new_cat[['play_unique_id', 'success_play']].drop_duplicates('play_unique_id')
         plays = plays.merge(success_slim, on='play_unique_id', how='left')
-        plays['success'] = plays['success_play'].apply(
-            lambda v: 1 if str(v).strip() in ('T', 'True', 'true', '1', '1.0') else 0
-        )
+        plays['success'] = (plays['success_play'].astype(str).str.strip()
+                            .isin(['T', 'True', 'true', '1', '1.0']).astype(int))
     else:
         plays['success'] = 0
 
@@ -355,11 +436,32 @@ def build_targeting_rates(_new_cat: pd.DataFrame, _old_cat: pd.DataFrame) -> pd.
     )
 
     result = player_grp.merge(group_grp, on=['role_group', 'route', 'coverage'], how='left')
+    # Pre-uppercased route so the field's hover lookups don't redo it per route
+    result['route_upper'] = result['route'].str.upper()
+    if _TIMING:
+        print(f'[xinfoviz] {"build targeting rates":<28} {time.perf_counter() - _t0:6.2f}s', flush=True)
     return result
 
 
-@st.cache_data(show_spinner='Loading catalog…')
-def load_catalog(path: Path) -> pd.DataFrame:
+def _zone_series(yd: pd.Series) -> pd.Series:
+    """Vectorised _field_zone(): same buckets, computed for a whole column at once."""
+    import numpy as np
+    y = np.trunc(pd.to_numeric(yd, errors='coerce'))
+    out = np.select([y <= 20, y <= 50, y <= 80, y > 80],
+                    ['Red Zone', 'Opp. Side', 'Own Side', 'Backed Up'], default='')
+    s = pd.Series(out, index=yd.index, dtype=object)
+    return s.where(s != '', None)
+
+
+# cache_resource: one shared catalog in memory instead of a fresh un-pickled
+# copy on every call (it was being copied 2-3 times per play). Read-only.
+@st.cache_resource(show_spinner='Loading catalog…', max_entries=2)
+def load_catalog(path: Path, data_key: str = '') -> pd.DataFrame:
+    with _timed('load catalog'):
+        return _disk_cached(Path(path), 'catalog', lambda: _read_catalog(path))
+
+
+def _read_catalog(path: Path) -> pd.DataFrame:
     # Only load columns actually used by the app — cuts CSV parse time significantly
     _ALWAYS = [
         'play_unique_id', 'game_code', 'game_date', 'week', 'period', 'time_remaining',
@@ -418,7 +520,10 @@ def load_catalog(path: Path) -> pd.DataFrame:
         df = df[df['distance'].notna() & (df['distance'] > 0)]
     if 'offensive_formation' in df.columns:
         df = df[df['offensive_formation'].notna() & (df['offensive_formation'].astype(str).str.strip() != '')]
-    return df
+    # Pre-computed field zone so stat lookups don't re-bucket every row each time
+    df = df.copy()
+    df['_zone'] = _zone_series(df['yd_from_goal'])
+    return df.reset_index(drop=True)
 
 
 def _safe_int(val, default=0):
@@ -476,8 +581,8 @@ def _play_label(row) -> str:
 
 
 @st.cache_data(show_spinner='Rendering…')
-def render_play(play_id: int, game_code: int, _hash: str):
-    cat = load_catalog(DATA_PATH)
+def render_play(play_id: int, game_code: int, data_key: str):
+    cat = load_catalog(DATA_PATH, data_key)
     matches = cat[(cat['play_unique_id']==play_id) & (cat['game_code']==game_code)]
     if matches.empty:
         matches = cat[cat['play_unique_id']==play_id]
@@ -540,7 +645,7 @@ def render_play(play_id: int, game_code: int, _hash: str):
     events_rusher   = ''
     events_receiver = ''   # Full name "First Last" from events file
     try:
-        old_cat   = load_old_catalog_receivers(DATA_PATH_OLD)
+        old_cat   = load_old_catalog_receivers(DATA_PATH_OLD, data_key)
         _pid      = pd.to_numeric(play_id, errors='coerce')
         old_match = old_cat[old_cat['play_unique_id'] == _pid]
         if not old_match.empty:
@@ -577,9 +682,9 @@ def render_play(play_id: int, game_code: int, _hash: str):
 
 
 @st.cache_data(show_spinner=False)
-def render_play_png(play_id: int, game_code: int, _hash: str) -> bytes:
+def render_play_png(play_id: int, game_code: int, data_key: str) -> bytes:
     """Generate the static matplotlib PNG — called only when Download is clicked."""
-    cat = load_catalog(DATA_PATH)
+    cat = load_catalog(DATA_PATH, data_key)
     matches = cat[(cat['play_unique_id']==play_id) & (cat['game_code']==game_code)]
     if matches.empty:
         matches = cat[cat['play_unique_id']==play_id]
@@ -1088,6 +1193,8 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
         if not attacking_right:
             px = -px
             py = 53.3 - py
+        # Keep players on the field: deep defenders can't sit past the end line
+        px = max(_end_left_x + 1.0, min(px, _end_right_x - 1.0))
         return px, py
 
     def _fmt_num(val):
@@ -1101,21 +1208,34 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
 
     fig = go.Figure()
 
+    # Shapes/annotations are collected in plain lists and attached in ONE
+    # update at the end. Adding ~200 of them one at a time made Plotly
+    # re-validate the whole growing list on every add (seconds per play).
+    _shapes, _annos = [], []
+
+    def _shape(**kw):
+        if 'line_width' in kw:
+            kw['line'] = {**kw.get('line', {}), 'width': kw.pop('line_width')}
+        _shapes.append(kw)
+
+    def _anno(**kw):
+        _annos.append(kw)
+
     # Grass stripes
     for idx, sx in enumerate(range(int(x_min), int(x_max), 5)):
         left  = max(float(sx),     x_min)
         right = min(float(sx + 5), x_max)
         if left < right:
             color = C_FIELD_A if idx % 2 == 0 else C_FIELD_B
-            fig.add_shape(type='rect', x0=left, x1=right, y0=y_min, y1=y_max,
+            _shape(type='rect', x0=left, x1=right, y0=y_min, y1=y_max,
                           fillcolor=color, line_width=0, layer='below')
 
     # Sidelines (stop at the end lines)
     _sl_x0 = max(x_min, _end_left_x)
     _sl_x1 = min(x_max, _end_right_x)
-    fig.add_shape(type='line', x0=_sl_x0, x1=_sl_x1, y0=y_min, y1=y_min,
+    _shape(type='line', x0=_sl_x0, x1=_sl_x1, y0=y_min, y1=y_min,
                   line=dict(color='white', width=2.5))
-    fig.add_shape(type='line', x0=_sl_x0, x1=_sl_x1, y0=y_max, y1=y_max,
+    _shape(type='line', x0=_sl_x0, x1=_sl_x1, y0=y_max, y1=y_max,
                   line=dict(color='white', width=2.5))
 
     # Per-yard tick marks (field of play only — none in the end zones)
@@ -1123,9 +1243,9 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
     for yd in range(int(x_min), int(x_max) + 1):
         if not (_goal_left_x < yd < _goal_right_x):
             continue
-        fig.add_shape(type='line', x0=yd, x1=yd, y0=y_min, y1=y_min + TICK_H,
+        _shape(type='line', x0=yd, x1=yd, y0=y_min, y1=y_min + TICK_H,
                       line=dict(color='white', width=0.7), opacity=0.5)
-        fig.add_shape(type='line', x0=yd, x1=yd, y0=y_max - TICK_H, y1=y_max,
+        _shape(type='line', x0=yd, x1=yd, y0=y_max - TICK_H, y1=y_max,
                       line=dict(color='white', width=0.7), opacity=0.5)
 
     # 10-yard markers + numbers: 10 20 30 40 50 40 30 20 10
@@ -1135,12 +1255,12 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
         if x_min <= yard_x <= x_max:
             # Draw the faint yard line only when it doesn't coincide with the LOS
             if yard_x != 0:
-                fig.add_shape(type='line', x0=yard_x, x1=yard_x, y0=y_min, y1=y_max,
+                _shape(type='line', x0=yard_x, x1=yard_x, y0=y_min, y1=y_max,
                               line=dict(color='white', width=1.0), opacity=0.3)
             # Always draw the number — overlap with LOS is fine and intentional
             label_val = marker if marker <= 50 else (100 - marker)
             for txt_y, anchor, rotate in [(y_min + 1.6, 'bottom', 0), (y_max - 1.6, 'top', 180)]:
-                fig.add_annotation(x=yard_x, y=txt_y, text=str(int(label_val)),
+                _anno(x=yard_x, y=txt_y, text=str(int(label_val)),
                        showarrow=False,
                        font=dict(color='white', size=44*SCALE, family='Arial Black'),
                        opacity=0.18, yanchor=anchor, xanchor='center',
@@ -1151,7 +1271,7 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
         for hx in range(int(x_min) - 1, int(x_max) + 2):
             if not (_goal_left_x < hx < _goal_right_x):
                 continue
-            fig.add_shape(type='line', x0=hx - HASH_W, x1=hx + HASH_W,
+            _shape(type='line', x0=hx - HASH_W, x1=hx + HASH_W,
                           y0=hash_y, y1=hash_y,
                           line=dict(color='white', width=1.0), opacity=0.6)
 
@@ -1166,26 +1286,26 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
         if vis_hi <= vis_lo:
             return
         # End zone fill
-        fig.add_shape(type='rect', x0=vis_lo, x1=vis_hi, y0=y_min, y1=y_max,
+        _shape(type='rect', x0=vis_lo, x1=vis_hi, y0=y_min, y1=y_max,
                       fillcolor=_primary(team), opacity=0.55, line_width=0, layer='below')
         # Out of bounds beyond the end line
         if goal_x < end_x and end_x < x_max:
-            fig.add_shape(type='rect', x0=end_x, x1=x_max, y0=y_min, y1=y_max,
+            _shape(type='rect', x0=end_x, x1=x_max, y0=y_min, y1=y_max,
                           fillcolor=C_BG, opacity=1.0, line_width=0, layer='below')
         elif goal_x > end_x and end_x > x_min:
-            fig.add_shape(type='rect', x0=x_min, x1=end_x, y0=y_min, y1=y_max,
+            _shape(type='rect', x0=x_min, x1=end_x, y0=y_min, y1=y_max,
                           fillcolor=C_BG, opacity=1.0, line_width=0, layer='below')
         # Goal line + end line
         for lx in (goal_x, end_x):
             if x_min <= lx <= x_max:
-                fig.add_shape(type='line', x0=lx, x1=lx, y0=y_min, y1=y_max,
+                _shape(type='line', x0=lx, x1=lx, y0=y_min, y1=y_max,
                               line=dict(color='white', width=2.5))
         # Team name, centered in the visible part of the end zone
         label = str(team or '').strip().upper()
         vis_w = vis_hi - vis_lo
         if label and vis_w >= 3.0:
             fs = min(40, 5.0 * vis_w, 460 / max(len(label), 1))
-            fig.add_annotation(x=(vis_lo + vis_hi) / 2, y=(y_min + y_max) / 2,
+            _anno(x=(vis_lo + vis_hi) / 2, y=(y_min + y_max) / 2,
                                text=f'<b>{label}</b>', showarrow=False,
                                textangle=textangle, xanchor='center', yanchor='middle',
                                font=dict(color='white', size=fs, family='Arial Black'),
@@ -1198,9 +1318,9 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
     _draw_endzone(_goal_left_x,  _end_left_x,  _ez_left_team,  textangle=-90)
 
     # LOS
-    fig.add_shape(type='line', x0=0, x1=0, y0=y_min, y1=y_max,
+    _shape(type='line', x0=0, x1=0, y0=y_min, y1=y_max,
                   line=dict(color='white', width=2.8))
-    fig.add_annotation(x=0.25, y=y_max - 0.8, text='LOS', showarrow=False,
+    _anno(x=0.25, y=y_max - 0.8, text='LOS', showarrow=False,
                        font=dict(color='white', size=7*SCALE), opacity=0.6,
                        xanchor='left', yanchor='top')
 
@@ -1211,9 +1331,9 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
     if distance and distance > 0:
         fd_x = float(distance) if attacking_right else -float(distance)
         if x_min <= fd_x <= x_max:
-            fig.add_shape(type='line', x0=fd_x, x1=fd_x, y0=y_min, y1=y_max,
+            _shape(type='line', x0=fd_x, x1=fd_x, y0=y_min, y1=y_max,
                           line=dict(color='#ffe066', width=2.0), opacity=0.45)
-            fig.add_annotation(x=fd_x + (0.25 if attacking_right else -0.25),
+            _anno(x=fd_x + (0.25 if attacking_right else -0.25),
                                y=y_max - 0.8, text='1st', showarrow=False,
                                font=dict(color='#ffe066', size=7*SCALE), opacity=0.65,
                                xanchor='left' if attacking_right else 'right', yanchor='top')
@@ -1257,6 +1377,7 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
     _oc = NFL_TEAM_COLORS.get(str(off_team).strip(), {}).get('primary', '#3a6ea5')
     _dc = NFL_TEAM_COLORS.get(str(def_team).strip(), {}).get('primary', '#a53a3a')
 
+    _ox, _oy, _onum, _ohover = [], [], [], []
     for _, p in df_off.iterrows():
         px, py = _to_plot(p['x_ft'], p['y_ft'])
         num  = _fmt_num(p.get('player_number'))
@@ -1268,16 +1389,16 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
             f"<span style='color:#aaaacc;font-size:11px'>Role: <b style='color:#fff'>{role}</b></span>"
             f"<extra></extra>"
         )
+        _ox.append(px); _oy.append(py); _onum.append(num); _ohover.append(hover)
+    if _ox:
+        # One trace for all 11 players: circles + numbers, per-player hover
         fig.add_trace(go.Scatter(
-            x=[px], y=[py], mode='markers',
+            x=_ox, y=_oy, mode='markers+text',
             marker=dict(size=MARKER_SIZE, color=C_OFF_FILL,
                         line=dict(color='white', width=LW_CIRCLE)),
-            hovertemplate=hover, showlegend=False,
-        ))
-        fig.add_trace(go.Scatter(
-            x=[px], y=[py], mode='text',
-            text=[num], textfont=dict(color=C_OFF_TEXT, size=10*SCALE, family='Arial Black'),
-            hovertemplate=hover, showlegend=False,
+            text=_onum, textposition='middle center',
+            textfont=dict(color=C_OFF_TEXT, size=10*SCALE, family='Arial Black'),
+            hovertemplate=_ohover, showlegend=False,
         ))
 
     # Draw receiver routes — targeted receiver in red, all others in gold
@@ -1337,9 +1458,10 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
             stat_blocks = []
             if targeting_rates is not None and not targeting_rates.empty:
                 tr = targeting_rates
+                _ru = tr['route_upper'] if 'route_upper' in tr.columns else tr['route'].str.upper()
                 pmask = (
                     (tr['last_name'] == matched_key) &
-                    (tr['route'].str.upper() == route_val.upper()) &
+                    (_ru == route_val.upper()) &
                     (tr['coverage'] == cov_label)
                 )
                 pr = tr[pmask]
@@ -1361,7 +1483,7 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
 
                 gmask = (
                     (tr['role_group'] == this_group) &
-                    (tr['route'].str.upper() == route_val.upper()) &
+                    (_ru == route_val.upper()) &
                     (tr['coverage'] == cov_label)
                 )
                 gr = tr[gmask]
@@ -1416,7 +1538,7 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
                     line=dict(color=r_color, width=r_width),
                     hoverinfo='skip', showlegend=False,
                 ))
-                fig.add_annotation(
+                _anno(
                     x=xs[-1], y=ys[-1],
                     ax=xs[-2], ay=ys[-2],
                     xref='x', yref='y', axref='x', ayref='y',
@@ -1485,7 +1607,7 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
                 hoverinfo='skip', showlegend=False,
             ))
             # Arrowhead at tip
-            fig.add_annotation(
+            _anno(
                 x=rxs[-1], y=rys[-1],
                 ax=rxs[-2], ay=rys[-2],
                 xref='x', yref='y', axref='x', ayref='y',
@@ -1496,6 +1618,7 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
 
     # Draw defense
     if df_def is not None and not df_def.empty:
+        _dx, _dy, _dnum, _dhover, _ringx, _ringy = [], [], [], [], [], []
         for _, p in df_def.iterrows():
             px, py = _to_plot(p['x_ft'], p['y_ft'])
             num   = _fmt_num(p.get('player_number'))
@@ -1510,25 +1633,27 @@ def build_plotly_field(df_off, df_def, yard_line, attacking_right, off_team, def
                 + "<extra></extra>"
             )
             if press == 1:
-                fig.add_trace(go.Scatter(
-                    x=[px], y=[py], mode='markers',
-                    marker=dict(size=MARKER_SIZE * 1.65, color='rgba(0,0,0,0)',
-                                line=dict(color='#ffdd00', width=LW_PRESS)),
-                    hoverinfo='skip', showlegend=False,
-                ))
+                _ringx.append(px); _ringy.append(py)
+            _dx.append(px); _dy.append(py); _dnum.append(num); _dhover.append(hover)
+        if _ringx:
             fig.add_trace(go.Scatter(
-                x=[px], y=[py], mode='markers',
-                marker=dict(size=MARKER_SIZE, color=C_DEF_FILL,
-                            line=dict(color='white', width=LW_CIRCLE)),
-                hovertemplate=hover, showlegend=False,
+                x=_ringx, y=_ringy, mode='markers',
+                marker=dict(size=MARKER_SIZE * 1.65, color='rgba(0,0,0,0)',
+                            line=dict(color='#ffdd00', width=LW_PRESS)),
+                hoverinfo='skip', showlegend=False,
             ))
-            fig.add_trace(go.Scatter(
-                x=[px], y=[py], mode='text',
-                text=[num], textfont=dict(color=C_DEF_TEXT, size=10*SCALE, family='Arial Black'),
-                hovertemplate=hover, showlegend=False,
-            ))
+        fig.add_trace(go.Scatter(
+            x=_dx, y=_dy, mode='markers+text',
+            marker=dict(size=MARKER_SIZE, color=C_DEF_FILL,
+                        line=dict(color='white', width=LW_CIRCLE)),
+            text=_dnum, textposition='middle center',
+            textfont=dict(color=C_DEF_TEXT, size=10*SCALE, family='Arial Black'),
+            hovertemplate=_dhover, showlegend=False,
+        ))
 
     fig.update_layout(
+        shapes=_shapes,
+        annotations=_annos,
         paper_bgcolor=C_BG,
         plot_bgcolor=C_FIELD_A,
         xaxis=dict(range=[x_min, x_max], showticklabels=False, showgrid=False,
@@ -1601,7 +1726,7 @@ def get_similar_plays(cat, row, dist_tolerance=1):
         if use_personnel:
             mask &= (cat['offensive_personnel'] == personnel)
         sub = cat[mask].copy()
-        sub['_zone'] = sub['yd_from_goal'].apply(_field_zone)
+        sub['_zone'] = sub['_zone'] if '_zone' in sub.columns else _zone_series(sub['yd_from_goal'])
         return sub[sub['_zone'] == zone]
 
     result = _filter(dist_tolerance)
@@ -1618,7 +1743,7 @@ def get_similar_plays(cat, row, dist_tolerance=1):
                 (cat['play_unique_id'] != pid)
             )
             sub = cat[mask].copy()
-            sub['_zone'] = sub['yd_from_goal'].apply(_field_zone)
+            sub['_zone'] = sub['_zone'] if '_zone' in sub.columns else _zone_series(sub['yd_from_goal'])
             return sub[sub['_zone'] == zone]
         result = _filter_no_personnel(dist_tolerance + 1)
     return result
@@ -1648,9 +1773,48 @@ def _sim_row_html(label, this_val, team_avg_val, league_avg_val, fmt_this, fmt_t
         </tr>"""
 
 
+@st.cache_resource(show_spinner='Merging x-stats…', max_entries=2)
+def _apply_xstats_cached(xstats_bytes: bytes, data_key: str) -> pd.DataFrame:
+    """Merge the uploaded weekly x-stats into the catalog once per upload,
+    instead of re-merging the whole catalog on every rerun."""
+    return apply_xstats(load_catalog(DATA_PATH, data_key), load_xstats(xstats_bytes))
+
+
+# Newer Streamlit can build the download only when it's clicked (data=callable).
+_DL_CALLABLE = 'callable' in (st.download_button.__doc__ or '')
+
+
+def _png_download(pid, gc, data_key, fname):
+    if _DL_CALLABLE:
+        kwargs = {}
+        if '"ignore"' in (st.download_button.__doc__ or ''):
+            kwargs['on_click'] = 'ignore'   # don't rerun the page after downloading
+        st.download_button('⬇  Download PNG',
+                           data=lambda: render_play_png(pid, gc, data_key),
+                           file_name=fname, mime='image/png', **kwargs)
+        return
+    # Older Streamlit: two-step — build the PNG only after "Prepare" is clicked.
+    _png_prepare_fragment(pid, gc, data_key, fname)
+
+
+def _png_prepare(pid, gc, data_key, fname):
+    ready_key = f'png_ready_{pid}_{gc}'
+    if not st.session_state.get(ready_key):
+        if st.button('🖼  Prepare PNG', key=f'prep_{pid}_{gc}'):
+            st.session_state[ready_key] = True
+    if st.session_state.get(ready_key):
+        st.download_button('⬇  Download PNG', data=render_play_png(pid, gc, data_key),
+                           file_name=fname, mime='image/png')
+
+
+# A fragment reruns only itself when its button is clicked (Streamlit >= 1.37)
+_png_prepare_fragment = st.fragment(_png_prepare) if hasattr(st, 'fragment') else _png_prepare
+
+
 def main():
-    cat     = load_catalog(DATA_PATH)
-    old_cat = load_old_catalog_receivers(DATA_PATH_OLD)
+    _dkey   = _data_key()
+    cat     = load_catalog(DATA_PATH, _dkey)
+    old_cat = load_old_catalog_receivers(DATA_PATH_OLD, _dkey)
 
     # ── Apply weekly x-stats if the user uploaded one ───────────────────────
     # xstats_file is populated by the sidebar uploader widget defined below;
@@ -1660,10 +1824,10 @@ def main():
     if 'xstats_bytes' in st.session_state and st.session_state['xstats_bytes']:
         _xstats_df = load_xstats(st.session_state['xstats_bytes'])
     if _xstats_df is not None:
-        cat = apply_xstats(cat, _xstats_df)
+        cat = _apply_xstats_cached(st.session_state['xstats_bytes'], _dkey)
 
-    # Compute once per session — this is the expensive aggregation step
-    targeting_rates = build_targeting_rates(cat, old_cat)
+    # Computed once per data version and shared — the expensive aggregation step
+    targeting_rates = build_targeting_rates(cat, old_cat, _dkey)
 
     with st.sidebar:
         st.markdown('### 🏈 xInfoViz')
@@ -1844,15 +2008,13 @@ def main():
     pid = st.session_state['rendered_pid']
     gc  = st.session_state['rendered_gc']
 
-    import os as _os
-    _field_mtime = str(_os.path.getmtime(Path(__file__).parent / 'xinfoviz_preview_field.py'))
-    _data_hash = str(DATA_PATH.stat().st_mtime) + _field_mtime
-    with st.spinner('Rendering…'):
+    _data_hash = _dkey
+    with st.spinner('Rendering…'), _timed('render_play'):
         try:
             row, df_off, df_def, receiver_name, player_routes, targeted_name, player_ids, play_coverage, player_roles, player_route_dists, events_passer, events_rusher, events_receiver = render_play(
                 play_id=pid,
                 game_code=gc,
-                _hash=_data_hash,
+                data_key=_data_hash,
             )
         except Exception as e:
             st.error(f'Could not render play: {e}')
@@ -1979,33 +2141,36 @@ def main():
         dn   = down_map.get(_safe_int(row.get('down'), 0), 'X')
         fname = f"xInfoViz_{off}_vs_{deff}_{qtr}_{time.replace(':','m')}s_{dn}_and_{dist}.png".replace(' ','_')
         # PNG is generated lazily — only when the button is clicked, not on every render
-        st.download_button(
-            '⬇  Download PNG',
-            data=render_play_png(pid, gc, _data_hash),
-            file_name=fname,
-            mime='image/png',
-        )
+        _png_download(pid, gc, _data_hash, fname)
 
     with col_info:
         import math as _math
 
         # ── Helper: compute season stat ───────────────────────────────────────
+        _team_subsets = {}
+
         def _sstat(team_col, team_val, filters, metric_col, is_pct=False, zone=None):
             """
             Compute a season stat for a team with optional filters and field zone.
             filters: list of (col, val) tuples
             """
             if not team_val or team_val == '—': return None
-            mask = cat[team_col] == team_val
+            # Narrow to the team's plays first (one pass over the catalog,
+            # reused across all popovers), then filter that small subset.
+            _tk = (team_col, team_val)
+            if _tk not in _team_subsets:
+                _team_subsets[_tk] = cat[cat[team_col] == team_val]
+            sub = _team_subsets[_tk]
             for fc, fv in (filters or []):
                 if fc and fv and str(fv).strip() not in ('—','nan',''):
-                    mask &= cat[fc].astype(str).str.strip() == str(fv).strip()
+                    sub = sub[sub[fc].astype(str).str.strip() == str(fv).strip()]
             if zone:
-                mask &= cat['yd_from_goal'].apply(_field_zone) == zone
-            sub = cat[mask]
+                _z = sub['_zone'] if '_zone' in sub.columns else _zone_series(sub['yd_from_goal'])
+                sub = sub[_z == zone]
             if len(sub) == 0: return None
             if is_pct:
-                val = sub[metric_col].apply(lambda v: 1 if str(v).strip() in ('T','True','true','1','1.0') else 0).mean()
+                val = (sub[metric_col].astype(str).str.strip()
+                       .isin(['T','True','true','1','1.0']).astype(int).mean())
             else:
                 val = pd.to_numeric(sub[metric_col], errors='coerce').mean()
             return round(val, 3), len(sub)
