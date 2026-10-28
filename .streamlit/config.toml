@@ -1,0 +1,13 @@
+[theme]
+# Always render dark, regardless of the viewer's light/dark system setting
+base = "dark"
+primaryColor = "#ff6b00"
+backgroundColor = "#0f0f1a"
+secondaryBackgroundColor = "#1a1a2e"
+textColor = "#e8e8f0"
+
+[client]
+# Hide the System / Light / Dark switcher (and the rest of the ⋮ menu)
+# so viewers can't change the theme. Use "viewer" instead if you'd rather
+# keep Print / Record screen in the menu (the theme switcher stays then).
+toolbarMode = "minimal"

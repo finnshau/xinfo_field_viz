@@ -2138,10 +2138,6 @@ def main():
             home_team=_clean(row.get('home_team_nickname'), ''),
         )
         st.plotly_chart(plotly_fig, use_container_width=True, config={'displayModeBar': False})
-        dn   = down_map.get(_safe_int(row.get('down'), 0), 'X')
-        fname = f"xInfoViz_{off}_vs_{deff}_{qtr}_{time.replace(':','m')}s_{dn}_and_{dist}.png".replace(' ','_')
-        # PNG is generated lazily — only when the button is clicked, not on every render
-        _png_download(pid, gc, _data_hash, fname)
 
     with col_info:
         import math as _math
